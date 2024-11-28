@@ -3,7 +3,6 @@ import cv2
 import pytesseract
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
@@ -12,6 +11,9 @@ app = Flask(__name__)
 ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png'}
 UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', './uploads')
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# A dictionary to store OCR results by task ID
+ocr_results = {}
 
 # Check if file extension is allowed
 def allowed_file(filename):
@@ -24,11 +26,11 @@ def format_date(date_str):
     return date_str
 
 # Improved OCR processing function in the background using ThreadPoolExecutor
-def run_ocr_in_background(file_path, callback):
+def run_ocr_in_background(file_path, task_id):
     # Read the image
     img = cv2.imread(file_path)
     if img is None:
-        callback({'error': 'Failed to read image. Please upload a valid image.'})
+        ocr_results[task_id] = {'error': 'Failed to read image. Please upload a valid image.'}
         return
 
     # Convert image to grayscale for better OCR performance
@@ -45,7 +47,7 @@ def run_ocr_in_background(file_path, callback):
         custom_config = r'--oem 3 --psm 6'  # OEM and PSM configuration for Tesseract
         text_results = pytesseract.image_to_string(roi, config=custom_config, lang='ara')  # Arabic language
     except Exception as e:
-        callback({'error': f'OCR processing failed: {str(e)}'})
+        ocr_results[task_id] = {'error': f'OCR processing failed: {str(e)}'}
         return
 
     # Process OCR results
@@ -72,11 +74,11 @@ def run_ocr_in_background(file_path, callback):
             if len(line) > 3 or line == "ذكر":  # Arabic-specific rule
                 lines_with_strings.append(line)
 
-    # Return OCR results via callback
-    callback({
+    # Save the OCR results
+    ocr_results[task_id] = {
         'lines_with_numbers': lines_with_numbers,
         'lines_with_strings': lines_with_strings
-    })
+    }
 
 @app.route('/ocr', methods=['POST'])
 def ocr():
@@ -95,12 +97,29 @@ def ocr():
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(file_path)
 
+    # Generate a unique task ID
+    task_id = str(len(ocr_results) + 1)
+
     # Use ThreadPoolExecutor for background processing (better management of multiple threads)
     executor = ThreadPoolExecutor(max_workers=1)  # Only 1 worker for OCR to avoid overloading CPU
-    future = executor.submit(run_ocr_in_background, file_path, lambda results: jsonify(results))
+    executor.submit(run_ocr_in_background, file_path, task_id)
 
-    # Respond to the user immediately, OCR will process in the background
-    return jsonify({'message': 'OCR is processing in the background'}), 202
+    # Respond with the task ID immediately
+    return jsonify({'message': 'OCR is processing in the background', 'task_id': task_id}), 202
+
+@app.route('/ocr/status/<task_id>', methods=['GET'])
+def get_status(task_id):
+    # Check if the OCR task is completed
+    result = ocr_results.get(task_id)
+    
+    if result is None:
+        return jsonify({'error': 'Task not found'}), 404
+    
+    if 'error' in result:
+        return jsonify({'error': result['error']}), 400
+
+    # Return the OCR results
+    return jsonify(result)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
